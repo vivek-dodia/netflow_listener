@@ -1,0 +1,4 @@
+prometheus-client==0.17.0
+    geoip2==4.7.0
+    nfstream==6.5.1
+
