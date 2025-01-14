@@ -198,3 +198,67 @@ class NetFlowMetrics:
             documentation='Traffic patterns by time period',
             labelnames=['period', 'direction', 'service']
         )
+
+
+        # Security-focused metrics
+        self.security_events = Counter(
+            name='netflow_security_events_total',
+            documentation='Security-related events detected',
+            labelnames=['event_type', 'severity', 'src_subnet', 'dst_subnet', 'protocol']
+        )
+
+        self.suspicious_flows = Counter(
+            name='netflow_suspicious_flows_total',
+            documentation='Suspicious flow patterns detected',
+            labelnames=['pattern_type', 'src_subnet', 'dst_subnet', 'protocol']
+        )
+
+        self.port_scan_attempts = Counter(
+            name='netflow_port_scan_attempts_total',
+            documentation='Potential port scanning attempts',
+            labelnames=['src_ip', 'src_subnet', 'scan_type']
+        )
+
+        self.connection_anomalies = Counter(
+            name='netflow_connection_anomalies_total',
+            documentation='Unusual connection patterns',
+            labelnames=['anomaly_type', 'src_subnet', 'dst_subnet', 'protocol']
+        )
+
+        self.data_exfiltration = Counter(
+            name='netflow_data_exfiltration_suspect_total',
+            documentation='Potential data exfiltration attempts',
+            labelnames=['severity', 'src_subnet', 'dst_subnet', 'protocol']
+        )
+
+        self.protocol_violations = Counter(
+            name='netflow_protocol_violations_total',
+            documentation='Protocol behavior violations',
+            labelnames=['protocol', 'violation_type', 'src_subnet']
+        )
+
+        self.behavior_patterns = Counter(
+            name='netflow_behavior_patterns_total',
+            documentation='Observed behavior patterns',
+            labelnames=['pattern_type', 'protocol', 'src_subnet', 'risk_level']
+        )
+
+        # Application performance metrics
+        self.app_latency = Histogram(
+            name='netflow_application_latency_seconds',
+            documentation='Application response time measurements',
+            labelnames=['app_type', 'operation_type', 'src_subnet'],
+            buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0)
+        )
+
+        self.app_errors = Counter(
+            name='netflow_application_errors_total',
+            documentation='Application-level errors detected',
+            labelnames=['app_type', 'error_type', 'src_subnet']
+        )
+
+        self.app_traffic = Counter(
+            name='netflow_application_traffic_total',
+            documentation='Application-specific traffic measurements',
+            labelnames=['app_type', 'operation_type', 'src_subnet', 'direction']
+        )

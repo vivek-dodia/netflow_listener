@@ -9,6 +9,8 @@ from collector.metrics import NetFlowMetrics
 from collector.geoip_handler import GeoIPHandler
 from utils.service_mapper import ServiceMapper
 from utils.flow_categorizer import FlowCategorizer
+from utils.protocol_detector import ProtocolDetector
+from utils.behavior_analyzer import BehaviorAnalyzer
 
 class NetFlowCollector:
     def __init__(self, netflow_port=2055, prometheus_port=9500):
@@ -16,6 +18,8 @@ class NetFlowCollector:
         self.prometheus_port = prometheus_port
         self.parser = NetFlowParser()
         self.metrics = NetFlowMetrics()
+        self.protocol_detector = ProtocolDetector()
+        self.behavior_analyzer = BehaviorAnalyzer()
         
         # Construct absolute path to GeoIP database
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -146,9 +150,20 @@ class NetFlowCollector:
             return src_subnet, dst_subnet
         except:
             return 'unknown/24', 'unknown/24'
-    
+
+    def _check_for_anomalies(self, flow, behavior):
+        """Check for traffic anomalies."""
+        anomalies = []
+        if behavior.get('intensity') == 'HIGH':
+            anomalies.append('high_intensity')
+        if behavior.get('risk_level') == 'HIGH':
+            anomalies.append('high_risk')
+        if flow.get('bytes', 0) > 1000000:  # 1MB+
+            anomalies.append('large_flow')
+        return anomalies
+
     def _process_flow(self, record):
-        """Process a flow record and update metrics."""
+        """Process a flow record with enhanced analysis."""
         try:
             # Validate required fields
             required_fields = ['source_id', 'src_ip', 'dst_ip', 'protocol', 'bytes', 'packets']
@@ -168,16 +183,53 @@ class NetFlowCollector:
             packets = record['packets']
             src_subnet, dst_subnet = self._get_subnets(src_ip, dst_ip)
             
+            # Service detection first (more reliable)
+            service = ServiceMapper.categorize_service(record)
+            
+            # Protocol detection (use service if protocol detection fails)
+            detected_protocol = self.protocol_detector.detect_protocol(record)
+            if detected_protocol == 'UNKNOWN' and service != 'unknown':
+                detected_protocol = service.upper()
+            
+            # Get direction and behavior info
+            direction = FlowCategorizer.determine_direction(dst_ip, self.server_ip)
+            size_category = FlowCategorizer.categorize_size(bytes_)
+            behavior = self.behavior_analyzer.analyze_flow(record, detected_protocol)
+
             # Get GeoIP information
             src_info = self.geoip.get_location_info(src_ip)
             dst_info = self.geoip.get_location_info(dst_ip)
             
-            # Get service and direction information
-            service = ServiceMapper.categorize_service(record)
-            direction = FlowCategorizer.determine_direction(dst_ip, self.server_ip)
-            size_category = FlowCategorizer.categorize_size(bytes_)
-            
-            # Update basic flow metrics
+            # Check for anomalies
+            anomalies = self._check_for_anomalies(record, behavior)
+            if anomalies:
+                for anomaly in anomalies:
+                    self.metrics.connection_anomalies.labels(
+                        anomaly_type=anomaly,
+                        src_subnet=src_subnet,
+                        dst_subnet=dst_subnet,
+                        protocol=detected_protocol
+                    ).inc()
+
+            # Security metrics based on behavior
+            if behavior.get('risk_level') == 'HIGH':
+                self.metrics.security_events.labels(
+                    event_type=behavior.get('type', 'unknown'),
+                    severity='high',
+                    src_subnet=src_subnet,
+                    dst_subnet=dst_subnet,
+                    protocol=detected_protocol
+                ).inc()
+
+            # Track behavior patterns
+            self.metrics.behavior_patterns.labels(
+                pattern_type=behavior.get('pattern', 'unknown'),
+                protocol=detected_protocol,
+                src_subnet=src_subnet,
+                risk_level=behavior.get('risk_level', 'LOW')
+            ).inc()
+
+            # Basic flow metrics
             self.metrics.bytes_total.labels(
                 source_id=source_id,
                 src_ip=src_ip,
@@ -202,7 +254,7 @@ class NetFlowCollector:
                 dst_subnet=dst_subnet
             ).inc(packets)
             
-            # Update service metrics
+            # Service metrics
             self.metrics.service_bytes.labels(
                 service=service,
                 direction=direction,
@@ -219,15 +271,16 @@ class NetFlowCollector:
                 dst_subnet=dst_subnet
             ).inc(packets)
             
-            # Update service connections
-            self.metrics.service_connections.labels(
-                service=service,
-                direction=direction,
-                source_id=source_id,
-                status='established'
-            ).inc()
-            
-            # Update flow size metrics
+            # Application metrics for specific protocols
+            if detected_protocol in ['HTTP2', 'QUIC', 'MONGODB', 'POSTGRESQL', 'DNS']:
+                self.metrics.app_traffic.labels(
+                    app_type=detected_protocol,
+                    operation_type=behavior.get('type', 'unknown'),
+                    src_subnet=src_subnet,
+                    direction=direction
+                ).inc(bytes_)
+
+            # Flow size metrics
             self.metrics.flow_size_category.labels(
                 category=size_category,
                 protocol=protocol,
@@ -235,86 +288,16 @@ class NetFlowCollector:
                 service=service
             ).inc()
             
-            # Update flow size distribution
-            self.metrics.flow_size.labels(
-                source_id=source_id,
-                protocol=protocol,
-                service=service,
-                direction=direction
-            ).observe(bytes_)
-            
-            # Update active flows gauge
-            self.metrics.active_flows.labels(
-                source_id=source_id,
-                protocol=protocol,
-                service=service
-            ).inc()
-            
-            # Update traffic direction metrics
-            self.metrics.direction_bytes.labels(
-                direction=direction,
-                source_id=source_id,
-                src_subnet=src_subnet,
-                dst_subnet=dst_subnet
-            ).inc(bytes_)
-            
-            self.metrics.direction_packets.labels(
-                direction=direction,
-                source_id=source_id,
-                src_subnet=src_subnet,
-                dst_subnet=dst_subnet
-            ).inc(packets)
-            
-            # Update protocol distribution
-            self.metrics.protocol_distribution.labels(
-                protocol=protocol,
-                source_id=source_id,
-                direction=direction
-            ).inc()
-            
-            # Update subnet traffic
-            self.metrics.subnet_traffic.labels(
-                subnet=src_subnet,
-                direction=direction,
-                source_id=source_id
-            ).inc(bytes_)
-            
-            # DNS-specific metrics
+            # DNS-specific processing
             if service == 'dns':
-                if direction == 'inbound':
-                    self.metrics.dns_queries.labels(
-                        direction=direction,
-                        source_id=source_id,
-                        query_size=str(bytes_),
-                        client_subnet=src_subnet
-                    ).inc()
-                    
-                    self.metrics.dns_clients.labels(
-                        client_ip=src_ip,
-                        source_id=source_id,
-                        client_subnet=src_subnet,
-                        client_asn=src_info['asn']
-                    ).inc()
-                else:
-                    response_type = 'standard' if bytes_ <= 512 else 'edns'
-                    self.metrics.dns_response_size.labels(
-                        source_id=source_id,
-                        response_type=response_type,
-                        client_subnet=dst_subnet
-                    ).observe(bytes_)
-            
-            # TCP-specific metrics
+                self._process_dns_flow(record, src_ip, src_info, src_subnet, dst_subnet, 
+                                    direction, source_id, bytes_)
+
+            # TCP-specific processing
             if protocol == '6' and 'tcp_flags' in record:
-                flags = record['tcp_flags']
-                for flag, bit in [('SYN', 0x02), ('ACK', 0x10), ('FIN', 0x01), ('RST', 0x04)]:
-                    if flags & bit:
-                        self.metrics.tcp_flags.labels(
-                            flag_type=flag,
-                            source_id=source_id,
-                            direction=direction
-                        ).inc()
+                self._process_tcp_flow(record, source_id, direction, src_subnet, dst_subnet)
             
-            # Flow duration metrics
+            # Duration and performance metrics
             if 'first_switched' in record and 'last_switched' in record:
                 duration = record['last_switched'] - record['first_switched']
                 if duration >= 0:
@@ -323,18 +306,20 @@ class NetFlowCollector:
                         protocol=protocol,
                         service=service
                     ).observe(duration)
-            
-            # Performance metrics
+
+            # Performance metric
             process_time = (datetime.now() - start_time).total_seconds()
             self.metrics.processing_time.labels(
                 operation='flow_processing',
                 template_id=str(record.get('template_id', 'unknown'))
             ).observe(process_time)
             
-            # Print flow information
+            # Print enhanced flow information
             print(f"\nProcessed flow: {src_ip}:{record.get('src_port', '?')} -> "
                   f"{dst_ip}:{record.get('dst_port', '?')} "
-                  f"Proto: {protocol} Service: {service} "
+                  f"Proto: {detected_protocol} Service: {service} "
+                  f"Behavior: {behavior.get('type', 'unknown')} Risk: {behavior.get('risk_level', 'LOW')} "
+                  f"Anomalies: {', '.join(anomalies) if anomalies else 'none'} "
                   f"Bytes: {bytes_} Packets: {packets}")
             
         except Exception as e:
@@ -343,6 +328,52 @@ class NetFlowCollector:
                 error_type='flow_processing',
                 source_id=str(record.get('source_id', 'unknown')),
                 template_id=str(record.get('template_id', 'unknown'))
+            ).inc()
+
+    def _process_dns_flow(self, record, src_ip, src_info, src_subnet, dst_subnet, 
+                         direction, source_id, bytes_):
+        """Process DNS-specific flow metrics."""
+        if direction == 'inbound':
+            self.metrics.dns_queries.labels(
+                direction=direction,
+                source_id=source_id,
+                query_size=str(bytes_),
+                client_subnet=src_subnet
+            ).inc()
+            
+            self.metrics.dns_clients.labels(
+                client_ip=src_ip,
+                source_id=source_id,
+                client_subnet=src_subnet,
+                client_asn=src_info['asn']
+            ).inc()
+        else:
+            response_type = 'standard' if bytes_ <= 512 else 'edns'
+            self.metrics.dns_response_size.labels(
+                source_id=source_id,
+                response_type=response_type,
+                client_subnet=dst_subnet
+            ).observe(bytes_)
+
+    def _process_tcp_flow(self, record, source_id, direction, src_subnet, dst_subnet):
+        """Process TCP-specific flow metrics."""
+        flags = record['tcp_flags']
+        for flag, bit in [('SYN', 0x02), ('ACK', 0x10), ('FIN', 0x01), ('RST', 0x04)]:
+            if flags & bit:
+                self.metrics.tcp_flags.labels(
+                    flag_type=flag,
+                    source_id=source_id,
+                    direction=direction
+                ).inc()
+        
+        # Check for potential SYN flood
+        if flags & 0x02 and not flags & 0x10:  # SYN without ACK
+            self.metrics.security_events.labels(
+                event_type='syn_flood',
+                severity='medium',
+                src_subnet=src_subnet,
+                dst_subnet=dst_subnet,
+                protocol='TCP'
             ).inc()
 
 def main():
