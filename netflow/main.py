@@ -11,6 +11,30 @@ from utils.service_mapper import ServiceMapper
 from utils.flow_categorizer import FlowCategorizer
 from utils.protocol_detector import ProtocolDetector
 from utils.behavior_analyzer import BehaviorAnalyzer
+from dotenv import load_dotenv
+import logging
+import logging.handlers
+
+# Load environment variables
+load_dotenv()
+
+# Setup logging
+logger = logging.getLogger('NetFlowCollector')
+logger.setLevel(logging.INFO)
+
+# Configure syslog if environment variables are set
+syslog_server = os.getenv('SYSLOG_SERVER')
+syslog_port = int(os.getenv('SYSLOG_PORT', 514))
+syslog_prefix = os.getenv('SYSLOG_PREFIX', 'netflow')
+
+if syslog_server:
+    syslog_handler = logging.handlers.SysLogHandler(
+        address=(syslog_server, syslog_port),
+	socktype=socket.SOCK_DGRAM
+    )
+    formatter = logging.Formatter(f'{syslog_prefix}: %(message)s')
+    syslog_handler.setFormatter(formatter)
+    logger.addHandler(syslog_handler)
 
 class NetFlowCollector:
     def __init__(self, netflow_port=2055, prometheus_port=9500):
@@ -28,6 +52,8 @@ class NetFlowCollector:
         if not os.path.exists(geoip_path):
             print(f"Warning: GeoIP database not found at {geoip_path}")
             print("GeoIP lookups will be disabled")
+            logger.warning(f"GeoIP database not found at {geoip_path}")
+            logger.warning("GeoIP lookups will be disabled")
             
         self.geoip = GeoIPHandler(geoip_path)
         self.server_ip = '148.76.96.103'  # Your DNS server IP
@@ -39,41 +65,48 @@ class NetFlowCollector:
             'server_ip': self.server_ip,
             'geoip_enabled': str(os.path.exists(geoip_path))
         })
-    
+        logger.info(f"NetFlow Collector initialized - NetFlow Port: {netflow_port}, Prometheus Port: {prometheus_port}")
+
     def start(self):
         """Start the collector."""
         try:
             print(f"Starting Prometheus metrics server on port {self.prometheus_port}")
+            logger.info(f"Starting Prometheus metrics server on port {self.prometheus_port}")
             start_http_server(self.prometheus_port)
             
             print(f"Starting NetFlow listener on port {self.netflow_port}")
+            logger.info(f"Starting NetFlow listener on port {self.netflow_port}")
             self._start_netflow_listener()
         except Exception as e:
-            print(f"Error starting collector: {e}")
+            error_msg = f"Error starting collector: {e}"
+            print(error_msg)
+            logger.error(error_msg)
             self.metrics.error_counter.labels(
                 error_type='startup',
                 source_id='system',
                 template_id='none'
             ).inc()
             raise
-    
+
     def _start_netflow_listener(self):
         """Start UDP listener for NetFlow data."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.bind(('0.0.0.0', self.netflow_port))
             print("NetFlow listener ready")
+            logger.info("NetFlow listener ready and accepting connections")
             
             while True:
                 try:
                     data, addr = sock.recvfrom(65535)
-                    print(f"Received packet from {addr[0]}:{addr[1]}")
                     self._handle_packet(data)
                 except KeyboardInterrupt:
                     print("\nShutting down...")
+                    logger.info("Received shutdown signal, stopping collector...")
                     break
                 except Exception as e:
-                    print(f"Error processing packet: {e}")
+                    error_msg = f"Error processing packet: {e}"
+                    logger.error(error_msg)
                     self.metrics.error_counter.labels(
                         error_type='packet_processing',
                         source_id='system',
@@ -82,22 +115,27 @@ class NetFlowCollector:
                     continue
                     
         except Exception as e:
-            print(f"Error binding to port {self.netflow_port}: {e}")
+            error_msg = f"Error binding to port {self.netflow_port}: {e}"
+            print(error_msg)
+            logger.error(error_msg)
             raise
         finally:
             try:
                 sock.close()
                 self.geoip.close()
+                logger.info("NetFlow collector shutdown completed")
             except Exception as e:
-                print(f"Error during shutdown: {e}")
-    
+                error_msg = f"Error during shutdown: {e}"
+                logger.error(error_msg)
+
     def _handle_packet(self, data):
         """Process incoming NetFlow packet."""
         try:
             header, offset = self.parser.parse_header(data)
             
             if header['version'] != 9:
-                print(f"Unsupported NetFlow version: {header['version']}")
+                error_msg = f"Unsupported NetFlow version: {header['version']}"
+                logger.warning(error_msg)
                 self.metrics.error_counter.labels(
                     error_type='unsupported_version',
                     source_id=str(header.get('source_id', 'unknown')),
@@ -110,13 +148,15 @@ class NetFlowCollector:
                     flowset_id, length = self.parser.parse_flowset_header(data[offset:])
                     
                     if length < 4:  # Basic sanity check
-                        print(f"Invalid flowset length: {length}")
+                        error_msg = f"Invalid flowset length: {length}"
+                        logger.warning(error_msg)
                         break
                         
                     flowset_data = data[offset+4:offset+length]
                     
                     if flowset_id == 0:  # Template flowset
                         self.parser.parse_template(flowset_data)
+                        logger.info(f"Processed template flowset ID: {flowset_id}")
                     else:  # Data flowset
                         records = self.parser.parse_data(flowset_id, flowset_data, header['source_id'])
                         for record in records:
@@ -126,7 +166,8 @@ class NetFlowCollector:
                     offset += length
                     
                 except Exception as e:
-                    print(f"Error processing flowset: {e}")
+                    error_msg = f"Error processing flowset: {e}"
+                    logger.error(error_msg)
                     self.metrics.error_counter.labels(
                         error_type='flowset_processing',
                         source_id=str(header.get('source_id', 'unknown')),
@@ -135,7 +176,8 @@ class NetFlowCollector:
                     break
                 
         except Exception as e:
-            print(f"Error processing packet header: {e}")
+            error_msg = f"Error processing packet header: {e}"
+            logger.error(error_msg)
             self.metrics.error_counter.labels(
                 error_type='header_processing',
                 source_id='unknown',
@@ -149,6 +191,7 @@ class NetFlowCollector:
             dst_subnet = '.'.join(dst_ip.split('.')[:3]) + '.0/24'
             return src_subnet, dst_subnet
         except:
+            logger.warning(f"Error calculating subnets for IPs: {src_ip}, {dst_ip}")
             return 'unknown/24', 'unknown/24'
 
     def _check_for_anomalies(self, flow, behavior):
@@ -156,10 +199,13 @@ class NetFlowCollector:
         anomalies = []
         if behavior.get('intensity') == 'HIGH':
             anomalies.append('high_intensity')
+            logger.warning(f"High intensity traffic detected from {flow.get('src_ip')} to {flow.get('dst_ip')}")
         if behavior.get('risk_level') == 'HIGH':
             anomalies.append('high_risk')
+            logger.warning(f"High risk behavior detected from {flow.get('src_ip')} to {flow.get('dst_ip')}")
         if flow.get('bytes', 0) > 1000000:  # 1MB+
             anomalies.append('large_flow')
+            logger.warning(f"Large flow detected: {flow.get('bytes')} bytes from {flow.get('src_ip')} to {flow.get('dst_ip')}")
         return anomalies
 
     def _process_flow(self, record):
@@ -169,7 +215,8 @@ class NetFlowCollector:
             required_fields = ['source_id', 'src_ip', 'dst_ip', 'protocol', 'bytes', 'packets']
             if not all(field in record for field in required_fields):
                 missing = [f for f in required_fields if f not in record]
-                print(f"Incomplete flow record, missing: {missing}")
+                error_msg = f"Incomplete flow record, missing: {missing}"
+                logger.warning(error_msg)
                 return
             
             start_time = datetime.now()
@@ -220,6 +267,7 @@ class NetFlowCollector:
                     dst_subnet=dst_subnet,
                     protocol=detected_protocol
                 ).inc()
+                logger.warning(f"High risk behavior detected - Type: {behavior.get('type', 'unknown')}, Source: {src_subnet}, Protocol: {detected_protocol}")
 
             # Track behavior patterns
             self.metrics.behavior_patterns.labels(
@@ -314,16 +362,9 @@ class NetFlowCollector:
                 template_id=str(record.get('template_id', 'unknown'))
             ).observe(process_time)
             
-            # Print enhanced flow information
-            print(f"\nProcessed flow: {src_ip}:{record.get('src_port', '?')} -> "
-                  f"{dst_ip}:{record.get('dst_port', '?')} "
-                  f"Proto: {detected_protocol} Service: {service} "
-                  f"Behavior: {behavior.get('type', 'unknown')} Risk: {behavior.get('risk_level', 'LOW')} "
-                  f"Anomalies: {', '.join(anomalies) if anomalies else 'none'} "
-                  f"Bytes: {bytes_} Packets: {packets}")
-            
         except Exception as e:
-            print(f"Error processing flow record: {e}")
+            error_msg = f"Error processing flow record: {e}"
+            logger.error(error_msg)
             self.metrics.error_counter.labels(
                 error_type='flow_processing',
                 source_id=str(record.get('source_id', 'unknown')),
