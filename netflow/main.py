@@ -208,6 +208,21 @@ class NetFlowCollector:
             logger.warning(f"Large flow detected: {flow.get('bytes')} bytes from {flow.get('src_ip')} to {flow.get('dst_ip')}")
         return anomalies
 
+    def _is_private_ip(self, ip):
+        """Check if IP address is private (RFC1918)."""
+        try:
+            # Convert IP string to integers for efficient comparison
+            parts = [int(part) for part in ip.split('.')]
+            return (
+                (parts[0] == 10) or                                # 10.0.0.0/8
+                (parts[0] == 172 and 16 <= parts[1] <= 31) or     # 172.16.0.0/12
+                (parts[0] == 192 and parts[1] == 168) or          # 192.168.0.0/16
+                (parts[0] == 127) or                              # localhost
+                (parts[0] == 169 and parts[1] == 254)             # link-local
+            )
+        except:
+            return False
+
     def _process_flow(self, record):
         """Process a flow record with enhanced analysis."""
         try:
@@ -244,9 +259,25 @@ class NetFlowCollector:
             behavior = self.behavior_analyzer.analyze_flow(record, detected_protocol)
 
             # Get GeoIP information
-            src_info = self.geoip.get_location_info(src_ip)
-            dst_info = self.geoip.get_location_info(dst_ip)
+            #src_info = self.geoip.get_location_info(src_ip)
+            #dst_info = self.geoip.get_location_info(dst_ip)
             
+            if self._is_private_ip(src_ip):
+                src_info = {
+                    'country': 'PRIVATE',
+                    'asn': 'RFC1918'
+                }
+            else:
+                src_info = self.geoip.get_location_info(src_ip)
+
+            if self._is_private_ip(dst_ip):
+                dst_info = {
+                    'country': 'PRIVATE',
+                    'asn': 'RFC1918'
+                }
+            else:
+                dst_info = self.geoip.get_location_info(dst_ip)
+
             # Check for anomalies
             anomalies = self._check_for_anomalies(record, behavior)
             if anomalies:
